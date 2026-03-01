@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import chromadb
@@ -6,22 +6,25 @@ from dotenv import load_dotenv
 from groq import Groq
 import os
 import re
+import tempfile
+import base64
+import edge_tts
 
 # ---------------- Load Environment ---------------- #
 load_dotenv()
-api_key = os.getenv("GROQ_API_KEY")
 
-if not api_key:
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY not found in .env file")
 
-groq_client = Groq(api_key=api_key)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ---------------- FastAPI Setup ---------------- #
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,9 +51,7 @@ class ActRequest(BaseModel):
 
 def extract_section(query: str):
     match = re.search(r'section\s*(\d+[A-Za-z]*)', query, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return None
+    return match.group(1) if match else None
 
 
 def detect_act_intent(query: str):
@@ -59,42 +60,27 @@ def detect_act_intent(query: str):
     ROUTING = {
         "transfer_of_property": [
             "landlord", "tenant", "lease", "rent",
-            "eviction", "notice", "vacate", "terminate", "property"
+            "eviction", "notice", "vacate", "terminate"
         ],
         "ipc": [
             "murder", "theft", "assault", "harassment",
             "cheating", "violence", "threat", "criminal"
         ],
         "consumeract": [
-            "consumer", "defective product", "refund",
+            "consumer", "refund", "defective product",
             "unfair trade practice"
         ],
         "protection_of_womendv": [
             "domestic violence", "husband beating",
-            "in-laws harassment", "abuse by husband"
+            "in-laws harassment"
         ],
-        "child_marriage": [
-            "child marriage"
-        ],
-        "motorvehicles": [
-            "accident", "drunk driving", "license",
-            "rash driving"
-        ],
-        "rightoinformation": [
-            "rti", "right to information"
-        ],
-        "dpdp": [
-            "data protection", "privacy", "personal data"
-        ],
-        "firbail": [
-            "fir", "bail", "anticipatory bail"
-        ],
-        "married_womans_act": [
-            "married woman property"
-        ],
-        "protection_of_children": [
-            "child abuse", "minor protection"
-        ]
+        "child_marriage": ["child marriage"],
+        "motorvehicles": ["accident", "drunk driving", "license"],
+        "rightoinformation": ["rti", "right to information"],
+        "dpdp": ["data protection", "privacy", "personal data"],
+        "firbail": ["fir", "bail", "anticipatory bail"],
+        "married_womans_act": ["married woman property"],
+        "protection_of_children": ["child abuse", "minor protection"]
     }
 
     for act_key, keywords in ROUTING.items():
@@ -107,83 +93,44 @@ def detect_act_intent(query: str):
 # ---------------- RAG Pipeline ---------------- #
 
 def rag_pipeline(user_query: str):
-
     try:
-        print("RAG PIPELINE CALLED")
-
         section_number = extract_section(user_query)
         detected_act = detect_act_intent(user_query)
 
-        # -------- 1️⃣ If Section Mentioned -------- #
+        # 1️⃣ Section-specific search
         if section_number:
-            print("Section detected:", section_number)
-
             results = collection.query(
                 query_texts=[user_query],
                 where={"section": section_number},
                 n_results=5,
-                include=["documents", "metadatas", "distances"]
+                include=["documents", "metadatas"]
             )
 
-        # -------- 2️⃣ If Act Intent Detected -------- #
+        # 2️⃣ Act-based routing
         elif detected_act:
-            print("Act routed to:", detected_act)
-
             results = collection.query(
                 query_texts=[user_query],
                 where={"act": detected_act},
                 n_results=8,
-                include=["documents", "metadatas", "distances"]
+                include=["documents", "metadatas"]
             )
 
-        # -------- 3️⃣ Otherwise Semantic Search -------- #
+        # 3️⃣ Semantic fallback
         else:
-            rewrite_prompt = f"""
-You are a legal query optimizer.
-
-Convert the user's question into a structured Indian legal search query.
-Include relevant legal keywords and concepts.
-
-User Query: {user_query}
-
-Return only the improved search query.
-"""
-
-            rewrite_response = groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": rewrite_prompt}],
-                model="llama-3.1-8b-instant",
-                temperature=0
-            )
-
-            expanded_query = rewrite_response.choices[0].message.content.strip()
-
             results = collection.query(
-                query_texts=[expanded_query],
+                query_texts=[user_query],
                 n_results=8,
-                include=["documents", "metadatas", "distances"]
+                include=["documents", "metadatas"]
             )
 
         documents = results.get("documents", [[]])[0]
         metadatas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
 
         if not documents:
             return "No relevant legal information found in the database."
 
-        # -------- Deduplicate Sections -------- #
-        seen_sections = set()
-        filtered_docs = []
-
-        for doc, meta in zip(documents, metadatas):
-            section = meta.get("section", "")
-            if section not in seen_sections:
-                seen_sections.add(section)
-                filtered_docs.append((doc, meta))
-
-        # -------- Build Retrieved Context -------- #
         retrieved_text = ""
-
-        for i, (doc, meta) in enumerate(filtered_docs):
+        for i, (doc, meta) in enumerate(zip(documents, metadatas)):
             act_name = meta.get("act", "Unknown Act")
             section = meta.get("section", "Unknown Section")
 
@@ -196,51 +143,36 @@ Section: {section}
 
 """
 
-        # -------- Final Prompt -------- #
         final_prompt = f"""
-You are NyayaAI, an expert Indian legal assistant.
+You are NyayaAI, an Indian legal assistant.
 
-STRICT RULES:
-- Use ONLY the provided legal text.
-- Do NOT introduce new laws.
-- Quote sections accurately.
-- If law not found, clearly say so.
+Use ONLY the provided legal text.
 
----------------------------------------
 USER QUESTION:
 {user_query}
----------------------------------------
 
 LEGAL TEXT:
 {retrieved_text}
 
----------------------------------------
-
-Respond strictly in this format:
+Respond in this format:
 
 ### Relevant Law
-(Quote exact section text and mention Act + Section + Source number)
+(Quote section + Act + Source number)
 
 ### Explanation
-(Simple explanation in plain English)
+(Simple explanation)
 
 ### What You Can Do
-(Practical legal steps based strictly on cited law)
+(Practical steps)
 """
 
         chat_completion = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": final_prompt}],
-            model="llama-3.1-8b-instant",
-            temperature=0.1
+            model="llama-3.3-70b-versatile",
+            temperature=0.2
         )
 
-        answer = chat_completion.choices[0].message.content
-
-        # -------- Optional Confidence Check -------- #
-        if distances and min(distances) > 1.5:
-            answer += "\n\n⚠️ Low confidence retrieval. Consider rephrasing your question."
-
-        return answer
+        return chat_completion.choices[0].message.content
 
     except Exception as e:
         return f"Error generating response: {str(e)}"
@@ -250,51 +182,57 @@ Respond strictly in this format:
 
 @app.post("/ask")
 def ask(question: Question):
-    answer = rag_pipeline(question.question)
-    return {"answer": answer}
+    return {"answer": rag_pipeline(question.question)}
 
 
 # ---------------- Explain Act Endpoint ---------------- #
 
 @app.post("/explain-act")
 def explain_act(request: ActRequest):
+    return {"answer": rag_pipeline(request.act_name)}
 
-    results = collection.query(
-        query_texts=[request.act_name],
-        where={"act": request.act_name},
-        n_results=30,
-        include=["documents", "metadatas"]
-    )
 
-    documents = results.get("documents", [[]])[0]
-    metadatas = results.get("metadatas", [[]])[0]
+# ---------------- Voice Query Endpoint ---------------- #
 
-    if not documents:
-        return {"answer": "Act not found in database."}
+@app.post("/api/voice-query")
+async def voice_query(audio: UploadFile = File(...)):
 
-    combined_text = ""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp_file:
+        tmp_file.write(await audio.read())
+        tmp_path = tmp_file.name
 
-    for doc, meta in zip(documents, metadatas):
-        section = meta.get("section", "Unknown Section")
-        combined_text += f"\nSection {section}:\n{doc}\n"
+    try:
+        # 1️⃣ Transcribe using Groq Whisper
+        with open(tmp_path, "rb") as audio_file:
+            transcript_response = groq_client.audio.transcriptions.create(
+                model="whisper-large-v3-turbo",
+                file=("audio.webm", audio_file.read())
+            )
 
-    summary_prompt = f"""
-You are NyayaAI.
+        transcript = transcript_response.text
 
-Summarize the following Act in simple language.
-Highlight:
-- Key rights
-- Offences
-- Remedies
+        # 2️⃣ Get legal answer
+        text_response = rag_pipeline(transcript)
 
-ACT CONTENT:
-{combined_text}
-"""
+        # 3️⃣ Convert to speech
+        tts_path = tmp_path + "_tts.mp3"
+        communicate = edge_tts.Communicate(text_response, "en-IN-NeerjaNeural")
+        await communicate.save(tts_path)
 
-    chat_completion = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": summary_prompt}],
-        model="llama-3.1-8b-instant",
-        temperature=0.1
-    )
+        with open(tts_path, "rb") as f:
+            audio_base64 = base64.b64encode(f.read()).decode("utf-8")
 
-    return {"answer": chat_completion.choices[0].message.content}
+        os.remove(tts_path)
+
+        return {
+            "transcript": transcript,
+            "text_response": text_response,
+            "audio_base64": audio_base64
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)

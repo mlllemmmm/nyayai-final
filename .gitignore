@@ -39,3 +39,10 @@ backend/data/raw_acts/
 
 # OS files
 .DS_Store
+venv/
+node_modules/
+.env
+__pycache__/
+*.log
+backend/vector_db/
+.venv/
