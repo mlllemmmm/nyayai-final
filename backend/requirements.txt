@@ -1,0 +1,10 @@
+fastapi[standard]
+pydantic
+chromadb
+python-dotenv
+groq
+sentence-transformers
+pdfplumber
+edge_tts
+python-multipart
+openai
