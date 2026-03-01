@@ -1,25 +1,25 @@
-import React, { useState } from "react";
-import Header from "./components/Header";
-import Tabs from "./components/Tabs";
-import LegalIssue from "./components/LegalIssue";
-import ActExplanation from "./components/ActExplanation";
-import VoiceHelp from "./components/Voicehelp";
+import React from "react";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
+import Navbar from "./components/Navbar";
+import Landing from "./pages/Landing";
+import Login from "./pages/Login";
+import Assistant from "./pages/Assistant";
+import About from "./pages/About";
+import "./App.css";
 
 function App() {
-  const [activeTab, setActiveTab] = useState("issue");
-
-  const renderTab = () => {
-    if (activeTab === "issue") return <LegalIssue />;
-    if (activeTab === "act") return <ActExplanation />;
-    if (activeTab === "voice") return <VoiceHelp />;
-  };
-
   return (
-    <div className="app">
-      <Header />
-      <Tabs activeTab={activeTab} setActiveTab={setActiveTab} />
-      <div className="content">{renderTab()}</div>
-    </div>
+    <BrowserRouter>
+      <div className="app min-h-screen bg-slate-50">
+        <Navbar />
+        <Routes>
+          <Route path="/" element={<Landing />} />
+          <Route path="/login" element={<Login />} />
+          <Route path="/assistant" element={<Assistant />} />
+          <Route path="/about" element={<About />} />
+        </Routes>
+      </div>
+    </BrowserRouter>
   );
 }
 
